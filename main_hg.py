@@ -1,3 +1,5 @@
+import os
+import os.path as osp
 import argparse
 from tqdm import tqdm
 
@@ -50,14 +52,31 @@ def train(model: torch.nn.Module, optimizer: torch.optim.Optimizer,
     return tot_loss / tot_samples
 
 
-def evaluate(model: torch.nn.Module, tokenizer: AutoTokenizer, eval_loader: DataLoader, metric):
+def evaluate(model: torch.nn.Module, tokenizer: AutoTokenizer, 
+             eval_loader: DataLoader, metric, epoch: int = 0):
+    def postprocess_text(preds, labels):
+        preds = [pred.strip() for pred in preds]
+        labels = [[label.strip()] for label in labels]
+
+        return preds, labels
+
     model.eval()
     device = list(model.parameters())[0].data.device
-    for batch in eval_loader:
-        batch = {k: v.to(device) for k, v in batch.items()}
-        outputs = model.generate(batch['input_ids'], max_length=1024)
-        predicted = [tokenizer.decode(x, skip_special_tokens=True) for x in outputs]
-        references = [tokenizer.decode(x, skip_special_tokens=True) for x in batch['labels'].cpu().tolist()]
+
+    with tqdm(total=len(eval_loader), desc=f'[EVAL] epoch {epoch:05d}') as pbar:
+        for batch in eval_loader:
+            batch = {k: v.to(device) for k, v in batch.items()}
+            outputs = model.generate(batch['input_ids'], max_length=1024)
+            outputs = outputs.cpu().numpy()
+            labels = batch['labels'].cpu().numpy()
+            preds = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+            refs = tokenizer.batch_decode(labels, skip_special_tokens=True)
+            preds, refs = postprocess_text(preds, refs)
+
+            metric.add_batch(predictions=preds, references=refs)
+            pbar.update(1)
+
+    return metric.compute()
 
 
 def main(args: argparse.Namespace):
@@ -90,38 +109,42 @@ def main(args: argparse.Namespace):
 
     print('preprocessing dataset')
     preprocessed_dataset = dataset.map(tokenize, batched=True, num_proc=8)
-    VALID_COLUMNS = ['input_ids', 'attention_mask', 'token_type_ids', 'labels']
-    columns_to_remove = [c for c in preprocessed_dataset['train'].column_names if c not in VALID_COLUMNS]
+    KEEP_COLUMNS = ['input_ids', 'attention_mask', 'token_type_ids', 'labels']
+    columns_to_remove = [c for c in preprocessed_dataset['train'].column_names if c not in KEEP_COLUMNS]
     print(f'columns to remove: {columns_to_remove}')
     preprocessed_dataset = preprocessed_dataset.remove_columns(columns_to_remove)
     preprocessed_dataset.set_format('torch')
     print(f'current dataset columns: {preprocessed_dataset.column_names}')
     train_dataset, test_dataset, val_dataset = [preprocessed_dataset[x] for x in ['train', 'test', 'validation']]
-    data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
-    train_loader = DataLoader(train_dataset, shuffle=True, batch_size=args.batch_size, collate_fn=data_collator)
-    test_loader = DataLoader(test_dataset, shuffle=False, batch_size=args.batch_size, collate_fn=data_collator)
-    val_loader = DataLoader(val_dataset, shuffle=False, batch_size=args.batch_size, collate_fn=data_collator)
+    train_loader = DataLoader(train_dataset, shuffle=True, batch_size=args.batch_size)
+    test_loader = DataLoader(test_dataset, shuffle=False, batch_size=args.batch_size)
+    val_loader = DataLoader(val_dataset, shuffle=False, batch_size=args.batch_size)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-    metric = load_metric('bleu')
+    metric = load_metric('sacrebleu')
 
     unwrapped_model = model
     model = nn.DataParallel(model)
 
-    evaluate(unwrapped_model, tokenizer, val_loader, metric)
+    # result = evaluate(unwrapped_model, tokenizer, val_loader, metric)
+    # print(result)
 
-    # model_inputs = tokenizer(["Translate English to Frensh: Life is like a box of chocolates.", "Today is Monday."], padding="longest", return_tensors="pt").to(device)
-    # labels = tokenizer(["La vie est comme une boîte de chocolat.", "Aujourd'hui c'est lundi."], padding="longest", return_tensors="pt").input_ids.to(device)
-
-    # loss = model(**model_inputs, labels=labels).loss
-    # print(loss)
-
-    for epoch in range(args.num_epochs):
+    best_val_score = 0.0
+    best_val_epoch = 1
+    for epoch in range(1, args.num_epochs + 1):
         loss = train(model, optimizer, train_loader, epoch)
 
-        print(f'epoch {epoch:05d}, loss {loss:.8f}')
+        val_result = evaluate(unwrapped_model, tokenizer, val_loader, metric)
+        val_score = val_result['score']
+
+        if val_score > best_val_score:
+            best_val_score = val_score
+            best_val_epoch = epoch
+
+        print(f'epoch {epoch:05d}, loss {loss:.8f}, val {val_score:.4f}, best val {best_val_score:.4f}')
+        torch.save(unwrapped_model.state_dict(), osp.join(args.chkpt_dir, f'model_{epoch}.pt'))
 
 
 if __name__ == '__main__':
@@ -129,10 +152,13 @@ if __name__ == '__main__':
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--model_name', type=str, default='google/byt5-small')
     parser.add_argument('--dataset', type=str, default='gem-xsum')
-    parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--batch_size', type=int, default=24)
     parser.add_argument('--lr', type=float, default=0.001)
     parser.add_argument('--num_epochs', type=int, default=1000)
     parser.add_argument('--max_source_length', type=int, default=1024)
+    parser.add_argument('--chkpt_dir', type=str, default='chkpts/default')
     args = parser.parse_args()
+
+    os.makedirs(args.chkpt_dir, exist_ok=True)
 
     main(args)
