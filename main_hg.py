@@ -2,15 +2,19 @@ import os
 import os.path as osp
 import argparse
 from tqdm import tqdm
+from happy_config import ConfigLoader
+from dataclasses import asdict
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from transformers import T5ForConditionalGeneration, AutoTokenizer
 from transformers.data.data_collator import DataCollatorWithPadding
+from transformers.optimization import Adafactor
 from datasets import load_dataset, load_metric
 
 from utils import print_dict
+from hc_config import ExpConfig
 
 
 DATASET_CONFIG = {
@@ -29,12 +33,13 @@ DATASET_FIELDS = {
 def train(model: torch.nn.Module, optimizer: torch.optim.Optimizer, 
           train_loader: DataLoader, epoch: int):
     model.train()
+    optimizer.zero_grad()
     tot_loss = 0.0
     tot_samples = 0
+    acc_tokens = 0
 
     with tqdm(total=len(train_loader), desc=f'[TRAIN] epoch {epoch:05d}') as pbar:
         for batch in train_loader:
-            optimizer.zero_grad()
 
             # batch = {k: v.to(device) for k, v in batch.items()}
             outputs = model(**batch)
@@ -42,12 +47,17 @@ def train(model: torch.nn.Module, optimizer: torch.optim.Optimizer,
             loss = loss.mean()
             loss.backward()
 
-            optimizer.step()
+            num_batch_tokens = batch['attention_mask'].sum().item()
+            acc_tokens += num_batch_tokens
+            if acc_tokens >= config.opt.num_tokens_per_batch:
+                acc_tokens = 0
+                optimizer.step()
+                optimizer.zero_grad()
 
             tot_loss += loss.item()
             tot_samples += batch['input_ids'].size()[0]
             pbar.update(1)
-            pbar.set_postfix({'loss': f'{tot_loss / tot_samples:.4f}'})
+            pbar.set_postfix({'loss': f'{tot_loss / tot_samples:.4f}', 'tk': acc_tokens})
 
     return tot_loss / tot_samples
 
@@ -66,7 +76,7 @@ def evaluate(model: torch.nn.Module, tokenizer: AutoTokenizer,
     with tqdm(total=len(eval_loader), desc=f'[EVAL] epoch {epoch:05d}') as pbar:
         for batch in eval_loader:
             batch = {k: v.to(device) for k, v in batch.items()}
-            outputs = model.generate(batch['input_ids'], max_length=1024)
+            outputs = model.generate(batch['input_ids'], max_length=config.seq.max_target_length)
             outputs = outputs.cpu().numpy()
             labels = batch['labels'].cpu().numpy()
             preds = tokenizer.batch_decode(outputs, skip_special_tokens=True)
@@ -79,17 +89,17 @@ def evaluate(model: torch.nn.Module, tokenizer: AutoTokenizer,
     return metric.compute()
 
 
-def main(args: argparse.Namespace):
-    print_dict(args.__dict__, name="Command-Line Arguments")
-    device = torch.device(args.device)
+def main(config: ExpConfig):
+    print_dict(asdict(config), name="Command-Line Arguments")
+    device = torch.device(config.device)
 
     print('loading dataset')
-    dataset = load_dataset(*DATASET_CONFIG[args.dataset])
+    dataset = load_dataset(*DATASET_CONFIG[config.dataset])
     print(dataset)
 
     print('loading model')
-    model = T5ForConditionalGeneration.from_pretrained(args.model_name)
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    model = T5ForConditionalGeneration.from_pretrained(config.model_name)
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
     print("===== Model Config =====")
     print(model.config)
     print("========================")
@@ -97,11 +107,11 @@ def main(args: argparse.Namespace):
     model = model.to(device)
 
     def tokenize(samples):
-        text_field = DATASET_FIELDS[args.dataset]['input']
-        target_field = DATASET_FIELDS[args.dataset]['target']
-        model_inputs = tokenizer(samples[text_field], max_length=args.max_source_length, padding="max_length", truncation=True)
+        text_field = DATASET_FIELDS[config.dataset]['input']
+        target_field = DATASET_FIELDS[config.dataset]['target']
+        model_inputs = tokenizer(samples[text_field], max_length=config.seq.max_source_length, padding="max_length", truncation=True)
         with tokenizer.as_target_tokenizer():
-            labels = tokenizer(samples[target_field], max_length=args.max_source_length, padding="max_length", truncation=True).input_ids
+            labels = tokenizer(samples[target_field], max_length=config.seq.max_target_length, padding="max_length", truncation=True).input_ids
         return {
             **model_inputs,
             'labels': labels
@@ -117,23 +127,20 @@ def main(args: argparse.Namespace):
     print(f'current dataset columns: {preprocessed_dataset.column_names}')
     train_dataset, test_dataset, val_dataset = [preprocessed_dataset[x] for x in ['train', 'test', 'validation']]
 
-    train_loader = DataLoader(train_dataset, shuffle=True, batch_size=args.batch_size)
-    test_loader = DataLoader(test_dataset, shuffle=False, batch_size=args.batch_size)
-    val_loader = DataLoader(val_dataset, shuffle=False, batch_size=args.batch_size)
+    train_loader = DataLoader(train_dataset, shuffle=True, batch_size=config.opt.step_size)
+    test_loader = DataLoader(test_dataset, shuffle=False, batch_size=config.opt.step_size)
+    val_loader = DataLoader(val_dataset, shuffle=False, batch_size=config.opt.step_size)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = Adafactor(model.parameters(), lr=config.opt.lr, beta1=config.opt.beta1, relative_step=False)
 
     metric = load_metric('sacrebleu')
 
     unwrapped_model = model
     model = nn.DataParallel(model)
 
-    # result = evaluate(unwrapped_model, tokenizer, val_loader, metric)
-    # print(result)
-
     best_val_score = 0.0
     best_val_epoch = 1
-    for epoch in range(1, args.num_epochs + 1):
+    for epoch in range(1, config.opt.num_epochs + 1):
         loss = train(model, optimizer, train_loader, epoch)
 
         val_result = evaluate(unwrapped_model, tokenizer, val_loader, metric)
@@ -144,21 +151,13 @@ def main(args: argparse.Namespace):
             best_val_epoch = epoch
 
         print(f'epoch {epoch:05d}, loss {loss:.8f}, val {val_score:.4f}, best val {best_val_score:.4f}')
-        torch.save(unwrapped_model.state_dict(), osp.join(args.chkpt_dir, f'model_{epoch}.pt'))
+        torch.save(unwrapped_model.state_dict(), osp.join(config.chkpt_dir, f'model_{epoch}.pt'))
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument('--model_name', type=str, default='google/byt5-small')
-    parser.add_argument('--dataset', type=str, default='gem-xsum')
-    parser.add_argument('--batch_size', type=int, default=24)
-    parser.add_argument('--lr', type=float, default=0.001)
-    parser.add_argument('--num_epochs', type=int, default=1000)
-    parser.add_argument('--max_source_length', type=int, default=1024)
-    parser.add_argument('--chkpt_dir', type=str, default='chkpts/default')
-    args = parser.parse_args()
+    loader = ConfigLoader(ExpConfig, config="params/default.yml")
+    config = loader()
 
-    os.makedirs(args.chkpt_dir, exist_ok=True)
+    os.makedirs(config.chkpt_dir, exist_ok=True)
 
-    main(args)
+    main(config)
