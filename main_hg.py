@@ -9,7 +9,6 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from transformers import T5ForConditionalGeneration, AutoTokenizer
-from transformers.data.data_collator import DataCollatorWithPadding
 from transformers.optimization import Adafactor
 from datasets import load_dataset, load_metric
 
@@ -36,28 +35,37 @@ def train(model: torch.nn.Module, optimizer: torch.optim.Optimizer,
     optimizer.zero_grad()
     tot_loss = 0.0
     tot_samples = 0
-    acc_tokens = 0
 
     with tqdm(total=len(train_loader), desc=f'[TRAIN] epoch {epoch:05d}') as pbar:
-        for batch in train_loader:
+        for i, batch in enumerate(train_loader):
 
             # batch = {k: v.to(device) for k, v in batch.items()}
             outputs = model(**batch)
             loss = outputs.loss
             loss = loss.mean()
+            loss = loss / config.opt.acc_iter
             loss.backward()
 
-            num_batch_tokens = batch['attention_mask'].sum().item()
-            acc_tokens += num_batch_tokens
-            if acc_tokens >= config.opt.num_tokens_per_batch:
-                acc_tokens = 0
+            # num_batch_tokens = batch['attention_mask'].sum().item()
+            # acc_tokens += num_batch_tokens
+            # if acc_tokens >= config.opt.num_tokens_per_batch:
+            #     acc_tokens = 0
+            #     optimizer.step()
+            #     optimizer.zero_grad()
+
+            if (i + 1) % config.opt.acc_iter == 0:
                 optimizer.step()
                 optimizer.zero_grad()
 
             tot_loss += loss.item()
             tot_samples += batch['input_ids'].size()[0]
             pbar.update(1)
-            pbar.set_postfix({'loss': f'{tot_loss / tot_samples:.4f}', 'tk': acc_tokens})
+            pbar.set_postfix({'loss': f'{tot_loss / tot_samples:.4f}'})
+
+        # do gradient descent at the end of epoch
+        if (i + 1) % config.opt.acc_iter != 0:
+            optimizer.step()
+            optimizer.zero_grad()
 
     return tot_loss / tot_samples
 

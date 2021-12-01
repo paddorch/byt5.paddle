@@ -4,7 +4,7 @@ from enum import Enum
 @dataclass
 class OptConfig:
     step_size: int = 8
-    num_tokens_per_batch: int = 1048576
+    acc_iter: int = 64
     lr: float = 0.001
     num_epochs: int = 10000
     beta1 = 0.0
